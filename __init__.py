@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 1, 0),
     "category": "Development",
     "author": "Cemil Berk, m-dr",
-    "description": "Fast and reliable Python script shelf: create, paste, run, hotkey, and favorite multi-line scripts.",
+    "description": "Manage and run your Python scripts in Blender with one-click access, favorites, tags, sub-folder support, and in-panel editing.",
     "support": "COMMUNITY"
 }
 
@@ -22,8 +22,11 @@ from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
 # Path & Metadata Utilities
 # ---------------------------------------------------------------------------
 
+def get_metadata_path(script_dir):
+    return os.path.join(script_dir, "Manager_preferences", "preferences.json")
+
+
 def get_default_script_dir():
-    """Return a dependable default directory for scripts."""
     user_script_dir = bpy.utils.user_resource('SCRIPTS')
     if user_script_dir:
         default_dir = os.path.join(user_script_dir, "script_manager_shelf")
@@ -33,16 +36,17 @@ def get_default_script_dir():
 
 
 def get_script_dir(context=None):
-    """Retrieve the active scripts folder, creating it if needed."""
     if context is None:
         context = bpy.context
     try:
         addon_name = __package__ or "ScriptManagerPro"
-        addon_prefs = context.preferences.addons.get(addon_name, None)
-        if addon_prefs and addon_prefs.preferences and addon_prefs.preferences.script_dir.strip():
-            path = bpy.path.abspath(addon_prefs.preferences.script_dir.strip())
-            if os.path.isdir(path):
-                return path
+        # Search for addon preferences across possible registered names
+        for key in [addon_name, "bl_ext.blender_org.script_manager_pro", "script_manager_pro"]:
+            addon_prefs = context.preferences.addons.get(key, None)
+            if addon_prefs and addon_prefs.preferences and addon_prefs.preferences.script_dir.strip():
+                path = bpy.path.abspath(addon_prefs.preferences.script_dir.strip())
+                if os.path.isdir(path):
+                    return path
     except Exception:
         pass
 
@@ -51,17 +55,67 @@ def get_script_dir(context=None):
     return default_dir
 
 
-def get_metadata_path(script_dir):
-    return os.path.join(script_dir, "Manager_preferences", "preferences.json")
-
-
-def list_scripts(script_dir):
+def list_scripts_recursive(script_dir):
+    """Recursively list all .py scripts in script_dir and any sub-folders."""
     if not os.path.isdir(script_dir):
         return []
-    try:
-        return sorted([f for f in os.listdir(script_dir) if f.lower().endswith(".py") and not f.startswith(".")])
-    except Exception:
-        return []
+    scripts = []
+    for root, dirs, files in os.walk(script_dir):
+        # Ignore hidden folders, git, and preferences cache
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "Manager_preferences" and d != "__pycache__"]
+        for f in files:
+            if f.lower().endswith(".py") and not f.startswith("."):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, script_dir).replace("\\", "/")
+                scripts.append((full_path, rel_path, f))
+    scripts.sort(key=lambda x: x[1].lower())
+    return scripts
+
+
+def extract_auto_tags(rel_path):
+    """Extract tags automatically from sub-folders and filename tags like [mesh] or #tag."""
+    tags = set()
+    dir_name = os.path.dirname(rel_path)
+    if dir_name:
+        for part in dir_name.replace("\\", "/").split("/"):
+            part = part.strip()
+            if part:
+                tags.add(part.lower())
+
+    filename = os.path.basename(rel_path)
+    name_no_ext = os.path.splitext(filename)[0]
+
+    # Bracketed tags: e.g. [mesh] or [modeling, tool]
+    bracket_matches = re.findall(r'\[(.*?)\]', name_no_ext)
+    for match in bracket_matches:
+        for t in match.split(','):
+            t = t.strip()
+            if t:
+                tags.add(t.lower())
+
+    # Hashtags: e.g. #mesh #bevel
+    hash_matches = re.findall(r'#([a-zA-Z0-9_\-]+)', name_no_ext)
+    for t in hash_matches:
+        if t.strip():
+            tags.add(t.strip().lower())
+
+    # @ tags: e.g. @uv @unwrap
+    at_matches = re.findall(r'@([a-zA-Z0-9_\-]+)', name_no_ext)
+    for t in at_matches:
+        if t.strip():
+            tags.add(t.strip().lower())
+
+    return tags
+
+
+def clean_display_title(filename):
+    """Strip bracketed tags from the display name if desired."""
+    name_no_ext = os.path.splitext(filename)[0]
+    # Remove leading/trailing bracket tags for a clean title: e.g. "[mesh] extrude" -> "extrude"
+    cleaned = re.sub(r'\[.*?\]', '', name_no_ext).strip()
+    cleaned = re.sub(r'#[a-zA-Z0-9_\-]+', '', cleaned).strip()
+    cleaned = re.sub(r'@[a-zA-Z0-9_\-]+', '', cleaned).strip()
+    return cleaned if cleaned else name_no_ext
 
 
 def load_metadata(script_dir):
@@ -145,9 +199,13 @@ def run_python_file(filepath, context, reporter=None):
 DYNAMIC_OPERATOR_CLASSES = {}
 
 
-def make_operator_slug(filename):
-    base = os.path.splitext(filename)[0]
+def make_operator_slug(rel_path):
+    base = os.path.splitext(rel_path)[0]
     slug = re.sub(r'[^a-zA-Z0-9_]', '_', base).strip('_')
+    if len(slug) > 35:
+        import hashlib
+        short_hash = hashlib.md5(slug.encode('utf-8')).hexdigest()[:6]
+        slug = f"{slug[:28]}_{short_hash}"
     if not slug or slug[0].isdigit():
         slug = f"s_{slug}"
     return slug.lower()
@@ -164,9 +222,8 @@ def unregister_dynamic_operators():
 
 
 def register_dynamic_operators(context=None):
-    """Dynamically register one unique operator per script file.
-    This enables right-click -> 'Add to Quick Favorites' and 'Assign Shortcut'
-    to display the script's actual name in the Q menu and keymaps."""
+    """Dynamically register one unique operator per script.
+    Enables Right Click -> Quick Favorites / Hotkeys to show the script's name."""
     global DYNAMIC_OPERATOR_CLASSES
     unregister_dynamic_operators()
 
@@ -175,11 +232,10 @@ def register_dynamic_operators(context=None):
         return
 
     metadata = load_metadata(script_dir)
-    files = list_scripts(script_dir)
+    entries = list_scripts_recursive(script_dir)
 
-    for fname in files:
-        fpath = os.path.join(script_dir, fname)
-        slug = make_operator_slug(fname)
+    for full_path, rel_path, fname in entries:
+        slug = make_operator_slug(rel_path)
         idname = f"script_manager.run_{slug}"
 
         counter = 1
@@ -189,16 +245,16 @@ def register_dynamic_operators(context=None):
             idname = f"script_manager.run_{slug}"
             counter += 1
 
-        meta = metadata.get(fname, {})
-        display_name = meta.get("custom_display_name", "").strip() or os.path.splitext(fname)[0]
+        meta = metadata.get(rel_path, {}) or metadata.get(fname, {})
+        display_name = meta.get("custom_display_name", "").strip() or clean_display_title(fname)
 
         op_dict = {
             "bl_idname": idname,
             "bl_label": display_name,
-            "bl_description": f"Run {fname}",
+            "bl_description": f"Run {rel_path}",
             "bl_options": {'REGISTER', 'UNDO'},
-            "filepath": fpath,
-            "execute": (lambda script_path: (lambda self, ctx: {'FINISHED'} if run_python_file(script_path, ctx, self) else {'CANCELLED'}))(fpath)
+            "filepath": full_path,
+            "execute": (lambda script_path: (lambda self, ctx: {'FINISHED'} if run_python_file(script_path, ctx, self) else {'CANCELLED'}))(full_path)
         }
 
         try:
@@ -217,8 +273,7 @@ class ScriptManagerPreferences(AddonPreferences):
     bl_idname = __package__ or "ScriptManagerPro"
 
     script_dir: StringProperty(
-        name="Scripts Folder",
-        description="Path to folder containing your Python scripts (.py)",
+        name="Scripts Folder Path",
         subtype='DIR_PATH',
         default=""
     )
@@ -236,26 +291,27 @@ class ScriptManagerPreferences(AddonPreferences):
 # ---------------------------------------------------------------------------
 
 class ScriptItem(PropertyGroup):
-    name: StringProperty(name="File Name")
-    path: StringProperty(name="File Path")
-    favorite: BoolProperty(name="Favorite", default=False)
-    tags: StringProperty(name="Tags", default="")
-    custom_display_name: StringProperty(name="Display Name", default="")
-    operator_idname: StringProperty(name="Operator ID", default="")
-    edit_mode: BoolProperty(name="Edit Mode", default=False)
+    name: StringProperty()           # Filename
+    rel_path: StringProperty()       # Relative path with sub-folders
+    path: StringProperty()           # Absolute path
+    favorite: BoolProperty(default=False)
+    tags: StringProperty(default='')
+    custom_display_name: StringProperty(default='')
+    operator_idname: StringProperty(default='')
+    edit_mode: BoolProperty(default=False)
 
 
 # ---------------------------------------------------------------------------
-# Standard Operators
+# Operators
 # ---------------------------------------------------------------------------
 
 class SCRIPT_OT_RunScript(Operator):
     bl_idname = "script_manager.run_script"
     bl_label = "Run Script"
-    bl_description = "Run this Python script"
+    bl_description = "Run the selected Python script."
     bl_options = {'REGISTER', 'UNDO'}
 
-    path: StringProperty(name="Script Path")
+    path: StringProperty()
 
     def execute(self, context):
         if not self.path:
@@ -268,30 +324,28 @@ class SCRIPT_OT_RunScript(Operator):
 class SCRIPT_OT_NewScript(Operator):
     bl_idname = "script_manager.new_script"
     bl_label = "New Script"
-    bl_description = "Create a new Python script in your scripts folder"
+    bl_description = "Create a new Python script in your scripts folder."
     bl_options = {'REGISTER', 'UNDO'}
 
     script_name: StringProperty(
         name="Script Name",
-        description="Filename for the new script (e.g. bevel_all.py)",
+        description="Filename (e.g. bevel_all.py or subfolder/bevel.py)",
         default="new_script.py"
     )
 
     template: EnumProperty(
         name="Template",
-        description="Initial code template",
+        description="Boilerplate template",
         items=[
-            ('EMPTY', "Blank", "Empty python file"),
-            ('BASIC', "Basic (bpy)", "Standard import bpy boilerplate"),
-            ('SELECTION', "Selected Objects Loop", "Loop over selected objects"),
-            ('MODAL_OP', "Simple Operator", "Register a quick operator template"),
+            ('EMPTY', "Blank", "Empty file"),
+            ('BASIC', "Basic (bpy)", "Standard import bpy"),
+            ('SELECTION', "Loop Selected Objects", "Iterate over selected objects"),
         ],
         default='BASIC'
     )
 
     open_in_editor: BoolProperty(
         name="Open in Text Editor",
-        description="Immediately open this file in Blender's Text Editor",
         default=True
     )
 
@@ -313,7 +367,7 @@ class SCRIPT_OT_NewScript(Operator):
 
     def execute(self, context):
         script_dir = get_script_dir(context)
-        fname = self.script_name.strip()
+        fname = self.script_name.strip().replace("\\", "/")
         if not fname.lower().endswith(".py"):
             fname += ".py"
 
@@ -322,29 +376,12 @@ class SCRIPT_OT_NewScript(Operator):
             self.report({'ERROR'}, f"File already exists: {fname}")
             return {'CANCELLED'}
 
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
         templates = {
             'EMPTY': "",
-            'BASIC': (
-                "import bpy\n\n"
-                "# Your script here\n"
-                "print('Hello from ' + __file__)\n"
-            ),
-            'SELECTION': (
-                "import bpy\n\n"
-                "for obj in bpy.context.selected_objects:\n"
-                "    print(f'Selected: {obj.name}')\n"
-            ),
-            'MODAL_OP': (
-                "import bpy\n\n"
-                "class SimpleToolOperator(bpy.types.Operator):\n"
-                "    bl_idname = 'object.simple_tool'\n"
-                "    bl_label = 'Simple Tool'\n"
-                "    \n"
-                "    def execute(self, context):\n"
-                "        self.report({'INFO'}, 'Executed Simple Tool')\n"
-                "        return {'FINISHED'}\n\n"
-                "bpy.utils.register_class(SimpleToolOperator)\n"
-            ),
+            'BASIC': "import bpy\n\n# Your script here\nprint('Hello from ' + __file__)\n",
+            'SELECTION': "import bpy\n\nfor obj in bpy.context.selected_objects:\n    print(f'Selected: {obj.name}')\n",
         }
 
         content = templates.get(self.template, "")
@@ -352,7 +389,7 @@ class SCRIPT_OT_NewScript(Operator):
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(content)
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to create script file: {e}")
+            self.report({'ERROR'}, f"Failed to create file: {e}")
             return {'CANCELLED'}
 
         bpy.ops.script_manager.refresh_list()
@@ -366,34 +403,25 @@ class SCRIPT_OT_NewScript(Operator):
 
 class SCRIPT_OT_NewFromClipboard(Operator):
     bl_idname = "script_manager.new_from_clipboard"
-    bl_label = "New Script from Clipboard"
-    bl_description = "Create a new script file with the code currently in your clipboard"
+    bl_label = "Paste from Clipboard"
+    bl_description = "Create a new script file with the code currently in your clipboard."
     bl_options = {'REGISTER', 'UNDO'}
 
     script_name: StringProperty(
         name="Script Name",
-        description="Filename for the new script",
         default="pasted_script.py"
     )
 
     open_in_editor: BoolProperty(
         name="Open in Text Editor",
-        description="Open in Blender Text Editor after creating",
         default=False
     )
-
-    clipboard_preview: StringProperty(name="Code Preview", default="")
 
     def invoke(self, context, event):
         clipboard = context.window_manager.clipboard.strip()
         if not clipboard:
             self.report({'WARNING'}, "Clipboard is empty! Copy some code first.")
             return {'CANCELLED'}
-
-        lines = [line for line in clipboard.splitlines() if line.strip()]
-        line_count = len(clipboard.splitlines())
-        first_line = lines[0] if lines else ""
-        self.clipboard_preview = f"{line_count} line(s) - '{first_line[:50]}...'" if len(first_line) > 50 else f"{line_count} line(s)"
 
         script_dir = get_script_dir(context)
         counter = 1
@@ -406,7 +434,6 @@ class SCRIPT_OT_NewFromClipboard(Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text=f"Clipboard: {self.clipboard_preview}", icon='COPYDOWN')
         layout.prop(self, "script_name")
         layout.prop(self, "open_in_editor")
 
@@ -417,7 +444,7 @@ class SCRIPT_OT_NewFromClipboard(Operator):
             return {'CANCELLED'}
 
         script_dir = get_script_dir(context)
-        fname = self.script_name.strip()
+        fname = self.script_name.strip().replace("\\", "/")
         if not fname.lower().endswith(".py"):
             fname += ".py"
 
@@ -426,6 +453,7 @@ class SCRIPT_OT_NewFromClipboard(Operator):
             self.report({'ERROR'}, f"File already exists: {fname}")
             return {'CANCELLED'}
 
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(clipboard)
@@ -445,9 +473,9 @@ class SCRIPT_OT_NewFromClipboard(Operator):
 class SCRIPT_OT_OpenScript(Operator):
     bl_idname = "script_manager.open_script"
     bl_label = "Open in Text Editor"
-    bl_description = "Open this script in Blender's Text Editor"
+    bl_description = "Open the script in Blender's text editor."
 
-    path: StringProperty(name="Script Path")
+    path: StringProperty()
 
     def execute(self, context):
         if not os.path.isfile(self.path):
@@ -465,56 +493,26 @@ class SCRIPT_OT_OpenScript(Operator):
             try:
                 text = bpy.data.texts.load(self.path)
             except Exception as e:
-                self.report({'ERROR'}, f"Could not load file into Blender: {e}")
+                self.report({'ERROR'}, f"Could not load script into Text Editor: {e}")
                 return {'CANCELLED'}
 
-        found_area = False
         for area in context.window.screen.areas:
             if area.type == 'TEXT_EDITOR':
                 area.spaces.active.text = text
-                found_area = True
-                break
+                self.report({'INFO'}, f"Opened {filename} in Text Editor")
+                return {'FINISHED'}
 
-        if found_area:
-            self.report({'INFO'}, f"Opened {filename} in Text Editor")
-        else:
-            self.report({'INFO'}, f"Loaded {filename}. Switch to Scripting workspace to view.")
+        self.report({'INFO'}, f"Loaded {filename}. Switch to Text Editor / Scripting workspace to view.")
         return {'FINISHED'}
-
-
-class SCRIPT_OT_OpenExternal(Operator):
-    bl_idname = "script_manager.open_external"
-    bl_label = "Open in System Editor"
-    bl_description = "Open script file with your operating system's default editor (e.g. VS Code)"
-
-    path: StringProperty(name="Script Path")
-
-    def execute(self, context):
-        if not os.path.isfile(self.path):
-            self.report({'ERROR'}, f"File not found: {self.path}")
-            return {'CANCELLED'}
-
-        try:
-            if sys.platform == "win32":
-                os.startfile(self.path)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", self.path])
-            else:
-                subprocess.Popen(["xdg-open", self.path])
-            self.report({'INFO'}, f"Opened {os.path.basename(self.path)} in external editor")
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open external editor: {e}")
-            return {'CANCELLED'}
 
 
 class SCRIPT_OT_DeleteScript(Operator):
     bl_idname = "script_manager.delete_script"
     bl_label = "Delete Script"
-    bl_description = "Delete this script file"
+    bl_description = "Delete this script file."
     bl_options = {'REGISTER', 'UNDO'}
 
-    script_name: StringProperty(name="Script Name")
+    script_name: StringProperty()
 
     def invoke(self, context, event):
         return context.window_manager.invoke_confirm(self, event)
@@ -542,7 +540,7 @@ class SCRIPT_OT_DeleteScript(Operator):
 class SCRIPT_OT_ToggleFavorite(Operator):
     bl_idname = "script_manager.toggle_favorite"
     bl_label = "Toggle Favorite"
-    bl_description = "Add or remove this script from favorites"
+    bl_description = "Add or remove this script from favorites."
 
     script_name: StringProperty()
 
@@ -550,19 +548,18 @@ class SCRIPT_OT_ToggleFavorite(Operator):
         wm = context.window_manager
         script_dir = get_script_dir(context)
         metadata = load_metadata(script_dir)
-
         for item in wm.script_list:
-            if item.name == self.script_name:
+            if item.rel_path == self.script_name or item.name == self.script_name:
                 item.favorite = not item.favorite
-                if item.name not in metadata:
-                    metadata[item.name] = {}
-                metadata[item.name]["favorite"] = item.favorite
-                metadata[item.name]["tags"] = item.tags
-                metadata[item.name]["custom_display_name"] = item.custom_display_name
+                key = item.rel_path
+                metadata[key] = {
+                    "favorite": item.favorite,
+                    "tags": item.tags,
+                    "custom_display_name": item.custom_display_name
+                }
                 state = "added to" if item.favorite else "removed from"
                 self.report({'INFO'}, f"{item.name} {state} favorites.")
                 break
-
         save_metadata(script_dir, metadata)
         return {'FINISHED'}
 
@@ -570,14 +567,14 @@ class SCRIPT_OT_ToggleFavorite(Operator):
 class SCRIPT_OT_ToggleEditMode(Operator):
     bl_idname = "script_manager.toggle_edit_mode"
     bl_label = "Toggle Edit Mode"
-    bl_description = "Toggle metadata and name editing for this script"
+    bl_description = "Toggle metadata editing for this script."
 
     script_name: StringProperty()
 
     def execute(self, context):
         wm = context.window_manager
         for item in wm.script_list:
-            if item.name == self.script_name:
+            if item.rel_path == self.script_name or item.name == self.script_name:
                 item.edit_mode = not item.edit_mode
                 break
         return {'FINISHED'}
@@ -586,7 +583,7 @@ class SCRIPT_OT_ToggleEditMode(Operator):
 class SCRIPT_OT_SaveMetadata(Operator):
     bl_idname = "script_manager.save_metadata"
     bl_label = "Save Metadata"
-    bl_description = "Save display name and tags for this script"
+    bl_description = "Save tags and display name for this script."
 
     script_name: StringProperty()
 
@@ -594,18 +591,17 @@ class SCRIPT_OT_SaveMetadata(Operator):
         wm = context.window_manager
         script_dir = get_script_dir(context)
         metadata = load_metadata(script_dir)
-
         for item in wm.script_list:
-            if item.name == self.script_name:
-                if item.name not in metadata:
-                    metadata[item.name] = {}
-                metadata[item.name]["favorite"] = item.favorite
-                metadata[item.name]["tags"] = item.tags
-                metadata[item.name]["custom_display_name"] = item.custom_display_name
+            if item.rel_path == self.script_name or item.name == self.script_name:
+                key = item.rel_path
+                metadata[key] = {
+                    "favorite": item.favorite,
+                    "tags": item.tags,
+                    "custom_display_name": item.custom_display_name
+                }
                 item.edit_mode = False
-                self.report({'INFO'}, f"Saved settings for {item.name}")
+                self.report({'INFO'}, f"Metadata saved for {item.name}")
                 break
-
         save_metadata(script_dir, metadata)
         register_dynamic_operators(context)
         return {'FINISHED'}
@@ -613,8 +609,8 @@ class SCRIPT_OT_SaveMetadata(Operator):
 
 class SCRIPT_OT_RefreshList(Operator):
     bl_idname = "script_manager.refresh_list"
-    bl_label = "Refresh Scripts"
-    bl_description = "Reload script files from folder"
+    bl_label = "Refresh List"
+    bl_description = "Refresh the list of available scripts (including sub-folders)."
 
     def execute(self, context):
         wm = context.window_manager
@@ -622,29 +618,42 @@ class SCRIPT_OT_RefreshList(Operator):
 
         wm.script_list.clear()
         metadata = load_metadata(script_dir)
-        files = list_scripts(script_dir)
+        entries = list_scripts_recursive(script_dir)
 
         register_dynamic_operators(context)
 
-        for fname in files:
+        for full_path, rel_path, fname in entries:
             item = wm.script_list.add()
             item.name = fname
-            item.path = os.path.join(script_dir, fname)
-            meta = metadata.get(fname, {})
+            item.rel_path = rel_path
+            item.path = full_path
+
+            meta = metadata.get(rel_path, {}) or metadata.get(fname, {})
             item.favorite = meta.get("favorite", False)
-            item.tags = meta.get("tags", "")
+            
+            # Auto-tagging: combine manual tags with tags discovered from subfolders and filename brackets
+            manual_tags = meta.get("tags", "")
+            auto_tags = extract_auto_tags(rel_path)
+            if manual_tags:
+                item.tags = manual_tags
+            elif auto_tags:
+                item.tags = ", ".join(sorted(auto_tags))
+            else:
+                item.tags = ""
+
             item.custom_display_name = meta.get("custom_display_name", "")
-            slug = make_operator_slug(fname)
+
+            slug = make_operator_slug(rel_path)
             item.operator_idname = f"script_manager.run_{slug}"
 
-        self.report({'INFO'}, f"Refreshed ({len(files)} scripts)")
+        self.report({'INFO'}, f"Script list refreshed ({len(entries)} scripts).")
         return {'FINISHED'}
 
 
 class SCRIPT_OT_OpenScriptFolder(Operator):
     bl_idname = "script_manager.open_script_folder"
     bl_label = "Open Scripts Folder"
-    bl_description = "Open the scripts folder in your system's file manager"
+    bl_description = "Open the scripts folder in your file explorer."
 
     def execute(self, context):
         script_dir = get_script_dir(context)
@@ -660,98 +669,104 @@ class SCRIPT_OT_OpenScriptFolder(Operator):
             except Exception as e:
                 self.report({'ERROR'}, f"Failed to open folder: {e}")
         else:
-            self.report({'ERROR'}, "Scripts folder does not exist.")
+            self.report({'ERROR'}, "Invalid Scripts Folder Path.")
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-# UI Panel
+# UI Panel - Faithful to original layout with added New/Paste & Subfolders
 # ---------------------------------------------------------------------------
 
 class SCRIPT_PT_ScriptManagerPanel(Panel):
-    bl_label = "Script Shelf"
+    bl_label = "Script Manager"
     bl_idname = "SCRIPT_PT_script_manager"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Tool Shelf'
+    bl_category = 'Script Manager'
 
     def draw(self, context):
         layout = self.layout
         wm = context.window_manager
 
-        # Action Bar: New, Paste, Refresh, Open Folder
-        top_row = layout.row(align=True)
-        top_row.operator("script_manager.new_script", text="New", icon='ADD')
-        top_row.operator("script_manager.new_from_clipboard", text="Paste", icon='PASTEDOWN')
-        top_row.operator("script_manager.refresh_list", text="", icon='FILE_REFRESH')
-        top_row.operator("script_manager.open_script_folder", text="", icon='FILE_FOLDER')
+        # Row 1: Add new file actions
+        row = layout.row(align=True)
+        row.operator("script_manager.new_script", icon='ADD', text="New Script")
+        row.operator("script_manager.new_from_clipboard", icon='PASTEDOWN', text="Paste Script")
 
-        # Filter and Favorites row
-        filter_row = layout.row(align=True)
-        filter_row.prop(wm, "script_manager_search", text="", icon='VIEWZOOM', placeholder="Filter scripts...")
-        fav_icon = 'SOLO_ON' if wm.script_manager_fav_only else 'SOLO_OFF'
-        filter_row.prop(wm, "script_manager_fav_only", text="", icon=fav_icon)
+        # Row 2: Original Refresh List & Open Scripts Folder
+        row = layout.row(align=True)
+        row.operator("script_manager.refresh_list", icon='FILE_REFRESH', text="Refresh List")
+        row.operator("script_manager.open_script_folder", icon='FILE_FOLDER', text="Open Scripts Folder")
 
-        # Empty state handling
+        # Row 3: Original Tags filter & Favorites toggle
+        row = layout.row()
+        row.prop(wm, "filter_tags", text="Tags")
+        row.prop(wm, "show_favorites_only", toggle=True, text="Favorites", icon='SOLO_ON')
+
         if len(wm.script_list) == 0:
             box = layout.box()
-            box.label(text="No scripts found.", icon='INFO')
-            box.label(text="Click 'New' or 'Paste' above to add one.")
-            box.operator("script_manager.refresh_list", text="Scan Folder", icon='FILE_REFRESH')
+            box.label(text="No scripts found in folder.", icon='INFO')
+            box.label(text="Click 'New Script' or 'Paste Script' above.")
             return
 
-        search_query = wm.script_manager_search.strip().lower()
+        filter_term = wm.filter_tags.strip().lower()
 
-        # Scripts List
-        visible_count = 0
         for item in wm.script_list:
-            if wm.script_manager_fav_only and not item.favorite:
+            if wm.show_favorites_only and not item.favorite:
                 continue
 
-            display_name = item.custom_display_name.strip() or os.path.splitext(item.name)[0]
-
-            if search_query:
-                combined_text = f"{item.name} {display_name} {item.tags}".lower()
-                if search_query not in combined_text:
+            # Tag & Name filter check
+            if filter_term:
+                auto_tags = extract_auto_tags(item.rel_path)
+                combined = f"{item.name} {item.tags} {' '.join(auto_tags)} {item.custom_display_name}".lower()
+                if filter_term not in combined:
                     continue
 
-            visible_count += 1
             box = layout.box()
-            main_row = box.row(align=True)
+            row = box.row()
 
+            # Display name: show sub-folder prefix if in sub-folder
+            base_display = item.custom_display_name.strip() or clean_display_title(item.name)
+            subfolder = os.path.dirname(item.rel_path).replace("\\", "/")
+            if subfolder:
+                display_label = f"{subfolder}/{base_display}"
+            else:
+                display_label = base_display
+
+            row.label(text=display_label, icon='SCRIPT')
+
+            # Run button uses dynamic operator so Right Click -> Quick Favorites / Shortcut uses script name
             op_name = item.operator_idname if item.operator_idname in DYNAMIC_OPERATOR_CLASSES else "script_manager.run_script"
-            run_btn = main_row.operator(op_name, text=display_name, icon='PLAY')
+            run = row.operator(op_name, text="", icon='PLAY')
             if op_name == "script_manager.run_script":
-                run_btn.path = item.path
+                run.path = item.path
 
-            main_row.operator("script_manager.open_script", text="", icon='TEXT').path = item.path
+            edit = row.operator("script_manager.open_script", text="", icon='TEXT')
+            edit.path = item.path
 
-            fav_btn = main_row.operator("script_manager.toggle_favorite", text="", icon='SOLO_ON' if item.favorite else 'SOLO_OFF')
-            fav_btn.script_name = item.name
+            fav = row.operator("script_manager.toggle_favorite", text="", icon='SOLO_ON' if item.favorite else 'SOLO_OFF')
+            fav.script_name = item.rel_path
 
-            edit_toggle = main_row.operator("script_manager.toggle_edit_mode", text="", icon='GREASEPENCIL')
-            edit_toggle.script_name = item.name
+            toggle = row.operator("script_manager.toggle_edit_mode", text="", icon='GREASEPENCIL')
+            toggle.script_name = item.rel_path
 
             if item.edit_mode:
-                col = box.column(align=True)
-                col.prop(item, "custom_display_name", text="Display Name")
-                col.prop(item, "tags", text="Tags")
-
-                btn_row = col.row(align=True)
-                save_btn = btn_row.operator("script_manager.save_metadata", text="Save", icon='CHECKMARK')
-                save_btn.script_name = item.name
-
-                ext_btn = btn_row.operator("script_manager.open_external", text="Ext. Editor", icon='WINDOW')
-                ext_btn.path = item.path
-
+                box.prop(item, "custom_display_name", text="Display Name")
+                box.prop(item, "tags", text="Tags")
+                btn_row = box.row(align=True)
+                save = btn_row.operator("script_manager.save_metadata", text="Save")
+                save.script_name = item.rel_path
                 del_btn = btn_row.operator("script_manager.delete_script", text="Delete", icon='TRASH')
-                del_btn.script_name = item.name
-            elif item.tags.strip():
-                tag_row = box.row()
-                tag_row.label(text=f"Tags: {item.tags}", icon='TAGS')
-
-        if visible_count == 0:
-            layout.label(text="No scripts match filter criteria.", icon='INFO')
+                del_btn.script_name = item.rel_path
+            else:
+                display_tags = item.tags.strip()
+                if not display_tags:
+                    auto_tags = extract_auto_tags(item.rel_path)
+                    if auto_tags:
+                        display_tags = ", ".join(sorted(auto_tags))
+                if display_tags:
+                    row = box.row()
+                    row.label(text=f"Tags: {display_tags}")
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +780,6 @@ classes = (
     SCRIPT_OT_NewScript,
     SCRIPT_OT_NewFromClipboard,
     SCRIPT_OT_OpenScript,
-    SCRIPT_OT_OpenExternal,
     SCRIPT_OT_DeleteScript,
     SCRIPT_OT_ToggleFavorite,
     SCRIPT_OT_ToggleEditMode,
@@ -781,8 +795,8 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.WindowManager.script_list = CollectionProperty(type=ScriptItem)
-    bpy.types.WindowManager.script_manager_fav_only = BoolProperty(name="Favorites Only", default=False)
-    bpy.types.WindowManager.script_manager_search = StringProperty(name="Search", default="")
+    bpy.types.WindowManager.show_favorites_only = BoolProperty(name="Favorites", default=False)
+    bpy.types.WindowManager.filter_tags = StringProperty(name="Tags", default="")
 
     def deferred_init():
         try:
@@ -801,8 +815,8 @@ def unregister():
         bpy.utils.unregister_class(cls)
 
     del bpy.types.WindowManager.script_list
-    del bpy.types.WindowManager.script_manager_fav_only
-    del bpy.types.WindowManager.script_manager_search
+    del bpy.types.WindowManager.show_favorites_only
+    del bpy.types.WindowManager.filter_tags
 
 
 if __name__ == "__main__":
